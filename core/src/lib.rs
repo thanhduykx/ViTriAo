@@ -362,7 +362,6 @@ fn pairing_hint(e: &IdeviceError) -> &'static str {
         IdeviceError::InvalidHostID => {
             "Pairing file không thuộc iPhone này, hoặc đã bị thu hồi (sau khi Đặt lại Vị trí & Quyền riêng tư). Tạo lại bằng iloader."
         }
-        IdeviceError::PasswordProtected => "Mở khoá iPhone rồi thử lại.",
         IdeviceError::Socket(_) => {
             "lockdownd ngắt kết nối khi bắt tay. Thường do pairing file sai máy hoặc đã hết hiệu lực: tạo lại bằng iloader."
         }
