@@ -163,6 +163,7 @@ struct ContentView: View {
                     .font(.footnote)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
             }
 
             HStack(spacing: 12) {

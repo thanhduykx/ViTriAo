@@ -10,8 +10,10 @@
 //! chạy trong một task nền, nhận lệnh qua channel và gửi lại toạ độ định kỳ.
 
 use std::{
+    error::Error as StdError,
     ffi::{CStr, CString, c_char},
-    net::IpAddr,
+    io,
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{
         Arc, Mutex, OnceLock,
@@ -21,10 +23,11 @@ use std::{
 };
 
 use idevice::{
-    IdeviceService, RsdService,
+    IdeviceError, IdeviceService, RsdService,
     core_device_proxy::CoreDeviceProxy,
     dvt::{location_simulation::LocationSimulationClient, remote_server::RemoteServerClient},
     heartbeat::HeartbeatClient,
+    lockdown::LockdownClient,
     pairing_file::PairingFile,
     provider::{IdeviceProvider, TcpProvider},
     rsd::RsdHandshake,
@@ -36,7 +39,10 @@ use tokio::{
 };
 
 const RESEND_INTERVAL: Duration = Duration::from_secs(4);
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(6);
+/// iOS 17 bỏ simulatelocation cũ, chuyển sang CoreDeviceProxy + DVT.
+const FIRST_CORE_DEVICE_IOS: u32 = 17;
 const LABEL: &str = "ViTriAo";
 
 enum Cmd {
@@ -226,9 +232,141 @@ async fn session_main(
     rx: mpsc::Receiver<Cmd>,
     ready: oneshot::Sender<Result<(), String>>,
 ) {
+    let ios_major = match preflight(&provider).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ready.send(Err(e));
+            return;
+        }
+    };
+
+    if ios_major < FIRST_CORE_DEVICE_IOS {
+        return run_legacy(&provider, lat, lon, rx, ready).await;
+    }
     match CoreDeviceProxy::connect(&provider as &dyn IdeviceProvider).await {
         Ok(proxy) => run_dvt(proxy, lat, lon, rx, ready).await,
-        Err(proxy_err) => run_legacy(&provider, lat, lon, rx, ready, proxy_err.to_string()).await,
+        Err(e) => {
+            let _ = ready.send(Err(format!(
+                "[Bước 3/3] Mở CoreDeviceProxy thất bại: {}\n→ Pairing đã được chấp nhận nhưng iOS {ios_major} không mở được tunnel. Kiểm tra Developer Mode đang bật và iPhone đã mở khoá.",
+                describe(&e)
+            )));
+        }
+    }
+}
+
+/// Kiểm tra từng bước để báo đúng chỗ hỏng thay vì chỉ "socket io failed".
+/// Trả về phiên bản iOS chính (vd. 17, 18, 26).
+async fn preflight(provider: &TcpProvider) -> Result<u32, String> {
+    let target = SocketAddr::new(provider.addr, LockdownClient::LOCKDOWND_PORT);
+
+    // Bước 1: TCP thuần tới lockdownd qua VPN loopback.
+    match tokio::time::timeout(TCP_PROBE_TIMEOUT, tokio::net::TcpStream::connect(target)).await {
+        Err(_) => {
+            return Err(format!(
+                "[Bước 1/3] Không tới được {target} sau {}s.\n→ VPN chưa định tuyến: mở LocalDevVPN, chờ Connected rồi thử lại. Tắt các VPN/proxy khác.",
+                TCP_PROBE_TIMEOUT.as_secs()
+            ));
+        }
+        Ok(Err(e)) => {
+            return Err(format!(
+                "[Bước 1/3] Kết nối TCP tới {target} thất bại: {}\n→ {}",
+                io_detail(&e),
+                tcp_hint(&e, provider.addr)
+            ));
+        }
+        Ok(Ok(stream)) => drop(stream),
+    }
+
+    // Bước 2: lockdownd chấp nhận pairing file (bắt tay TLS).
+    let mut lockdown = LockdownClient::connect(provider as &dyn IdeviceProvider)
+        .await
+        .map_err(|e| format!("[Bước 2/3] Mở lockdownd thất bại: {}", describe(&e)))?;
+    lockdown
+        .start_session(&provider.pairing_file)
+        .await
+        .map_err(|e| {
+            format!(
+                "[Bước 2/3] lockdownd từ chối pairing file: {}\n→ {}",
+                describe(&e),
+                pairing_hint(&e)
+            )
+        })?;
+
+    // Không đọc được phiên bản thì mặc định đi đường iOS 17+.
+    let major = lockdown
+        .get_value(Some("ProductVersion"), None)
+        .await
+        .ok()
+        .and_then(|v| v.as_string().map(str::to_owned))
+        .and_then(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()))
+        .unwrap_or(FIRST_CORE_DEVICE_IOS);
+    Ok(major)
+}
+
+// ---------------------------------------------------------------------------
+// Diễn giải lỗi
+// ---------------------------------------------------------------------------
+
+/// Nối toàn bộ chuỗi lỗi (idevice giấu lỗi gốc sau "device socket io failed").
+fn describe<E: StdError + 'static>(e: &E) -> String {
+    let mut out = e.to_string();
+    let mut cur: Option<&(dyn StdError + 'static)> = e.source();
+    while let Some(cause) = cur {
+        out.push_str(": ");
+        match cause.downcast_ref::<io::Error>() {
+            Some(io_err) => out.push_str(&io_detail(io_err)),
+            None => out.push_str(&cause.to_string()),
+        }
+        cur = cause.source();
+    }
+    out
+}
+
+fn io_detail(e: &io::Error) -> String {
+    match e.raw_os_error() {
+        Some(code) => format!("{e} [{:?}, errno {code}]", e.kind()),
+        None => format!("{e} [{:?}]", e.kind()),
+    }
+}
+
+/// errno trên Darwin.
+mod errno {
+    pub const EPERM: i32 = 1;
+    pub const EACCES: i32 = 13;
+    pub const ENETDOWN: i32 = 50;
+    pub const ENETUNREACH: i32 = 51;
+    pub const ETIMEDOUT: i32 = 60;
+    pub const ECONNREFUSED: i32 = 61;
+    pub const EHOSTUNREACH: i32 = 65;
+}
+
+fn tcp_hint(e: &io::Error, ip: IpAddr) -> String {
+    const LOCAL_NETWORK: &str = "iOS có thể đang chặn quyền Mạng cục bộ của app: Cài đặt → Quyền riêng tư & Bảo mật → Mạng cục bộ → bật Vị Trí Ảo.";
+    match e.raw_os_error() {
+        Some(errno::EPERM | errno::EACCES) => LOCAL_NETWORK.to_string(),
+        Some(errno::EHOSTUNREACH | errno::ENETUNREACH | errno::ENETDOWN) => format!(
+            "Không có đường tới {ip}. VPN chưa Connected, hoặc {LOCAL_NETWORK}"
+        ),
+        Some(errno::ETIMEDOUT) => {
+            "VPN chưa định tuyến: bật lại LocalDevVPN rồi thử lại.".to_string()
+        }
+        Some(errno::ECONNREFUSED) => format!(
+            "Có đường tới {ip} nhưng cổng 62078 bị từ chối. IP trong Cài đặt có thể sai (LocalDevVPN dùng 10.7.0.1)."
+        ),
+        _ => "Kiểm tra VPN đã Connected và IP trong Cài đặt (mặc định 10.7.0.1).".to_string(),
+    }
+}
+
+fn pairing_hint(e: &IdeviceError) -> &'static str {
+    match e {
+        IdeviceError::InvalidHostID => {
+            "Pairing file không thuộc iPhone này, hoặc đã bị thu hồi (sau khi Đặt lại Vị trí & Quyền riêng tư). Tạo lại bằng iloader."
+        }
+        IdeviceError::PasswordProtected => "Mở khoá iPhone rồi thử lại.",
+        IdeviceError::Socket(_) => {
+            "lockdownd ngắt kết nối khi bắt tay. Thường do pairing file sai máy hoặc đã hết hiệu lực: tạo lại bằng iloader."
+        }
+        _ => "Pairing file có thể hỏng hoặc không đúng máy: tạo lại bằng iloader.",
     }
 }
 
@@ -244,24 +382,24 @@ async fn run_dvt(
         let rsd_port = proxy.tunnel_info().server_rsd_port;
         let adapter = proxy
             .create_software_tunnel()
-            .map_err(|e| format!("Không tạo được tunnel: {e}"))?;
+            .map_err(|e| format!("Không tạo được tunnel: {}", describe(&e)))?;
         let mut adapter = adapter.to_async_handle();
         let stream = adapter
             .connect(rsd_port)
             .await
-            .map_err(|e| format!("Không kết nối được RSD: {e}"))?;
+            .map_err(|e| format!("Không kết nối được RSD: {}", describe(&e)))?;
         let mut handshake = RsdHandshake::new(stream)
             .await
-            .map_err(|e| format!("RSD handshake lỗi: {e}"))?;
+            .map_err(|e| format!("RSD handshake lỗi: {}", describe(&e)))?;
         let mut server = RemoteServerClient::connect_rsd(&mut adapter, &mut handshake)
             .await
             .map_err(|e| {
-                format!("Không mở được DVT ({e}). Hãy bật Developer Mode trên iPhone.")
+                format!("Không mở được DVT ({}). Hãy bật Developer Mode trên iPhone.", describe(&e))
             })?;
         server
             .read_message(0)
             .await
-            .map_err(|e| format!("DVT không phản hồi: {e}"))?;
+            .map_err(|e| format!("DVT không phản hồi: {}", describe(&e)))?;
         Ok::<_, String>((adapter, server))
     };
 
@@ -276,13 +414,13 @@ async fn run_dvt(
     let mut client = match LocationSimulationClient::new(&mut server).await {
         Ok(c) => c,
         Err(e) => {
-            let _ = ready.send(Err(format!("Không mở được LocationSimulation: {e}")));
+            let _ = ready.send(Err(format!("Không mở được LocationSimulation: {}", describe(&e))));
             return;
         }
     };
 
     if let Err(e) = client.set(lat, lon).await {
-        let _ = ready.send(Err(format!("Đặt vị trí thất bại: {e}")));
+        let _ = ready.send(Err(format!("Đặt vị trí thất bại: {}", describe(&e))));
         return;
     }
     let _ = ready.send(Ok(()));
@@ -325,20 +463,20 @@ async fn run_legacy(
     lon: f64,
     mut rx: mpsc::Receiver<Cmd>,
     ready: oneshot::Sender<Result<(), String>>,
-    proxy_err: String,
 ) {
     let mut client = match LocationSimulationService::connect(provider as &dyn IdeviceProvider).await
     {
         Ok(c) => c,
         Err(e) => {
             let _ = ready.send(Err(format!(
-                "Không kết nối được thiết bị.\n• CoreDeviceProxy (iOS 17+): {proxy_err}\n• simulatelocation (iOS ≤16, cần mount DDI): {e}\nKiểm tra: VPN đã bật, pairing file đúng của máy này, Developer Mode đang bật."
+                "[iOS ≤16] Mở simulatelocation thất bại: {}\n→ iOS 16 trở xuống cần mount Developer Disk Image trước.",
+                describe(&e)
             )));
             return;
         }
     };
     if let Err(e) = client.set(&lat.to_string(), &lon.to_string()).await {
-        let _ = ready.send(Err(format!("Đặt vị trí thất bại: {e}")));
+        let _ = ready.send(Err(format!("Đặt vị trí thất bại: {}", describe(&e))));
         return;
     }
     let _ = ready.send(Ok(()));

@@ -5,3 +5,8 @@ App/Info.plist
 *.ipa
 .DS_Store
 xcuserdata/
+
+# Pairing records contain device private keys: never commit
+*.mobiledevicepairing
+pairingFile.plist
+*pairing*.plist
