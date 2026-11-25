@@ -1,0 +1,27 @@
+[package]
+name = "locsim_core"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+idevice = { version = "=0.1.68", default-features = false, features = [
+  "ring",
+  "tcp",
+  "heartbeat",
+  "core_device_proxy",
+  "tunnel_tcp_stack",
+  "rsd",
+  "dvt",
+  "location_simulation",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

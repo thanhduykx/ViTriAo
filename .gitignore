@@ -1,0 +1,7 @@
+core/target/
+build/
+ViTriAo.xcodeproj/
+App/Info.plist
+*.ipa
+.DS_Store
+xcuserdata/

@@ -1,0 +1,37 @@
+workflows:
+  unsigned-ipa:
+    name: ViTriAo – IPA chưa ký
+    instance_type: mac_mini_m2
+    max_build_duration: 45
+    environment:
+      xcode: latest
+    triggering:
+      events: [push]
+      branch_patterns:
+        - pattern: "*"
+    cache:
+      cache_paths:
+        - $HOME/.cargo/registry
+        - $CM_BUILD_DIR/core/target
+    scripts:
+      - name: Cài Rust
+        script: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          echo 'source "$HOME/.cargo/env"' >> ~/.zprofile
+          source "$HOME/.cargo/env"
+          rustc --version
+      - name: Build lõi Rust (aarch64-apple-ios)
+        script: |
+          source "$HOME/.cargo/env"
+          ./scripts/build-core.sh
+      - name: Tạo project Xcode (XcodeGen)
+        script: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen generate
+      - name: Build IPA
+        script: ./scripts/build-ipa.sh
+    artifacts:
+      - build/ViTriAo.ipa
+      - build/DerivedData/Logs/Build/*.xcactivitylog
